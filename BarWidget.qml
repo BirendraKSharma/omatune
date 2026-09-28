@@ -21,6 +21,11 @@ BarWidget {
   readonly property bool showTitle: setting("showTitle", true) !== false && String(setting("showTitle", true)) !== "false"
   readonly property int maxTitleChars: Math.max(8, Math.min(80, parseInt(setting("maxTitleChars", 28), 10) || 28))
   readonly property bool autoRadio: setting("autoRadio", true) !== false && String(setting("autoRadio", true)) !== "false"
+  readonly property bool saveHistory: setting("saveHistory", true) !== false && String(setting("saveHistory", true)) !== "false"
+  readonly property bool cacheSongs: setting("cacheSongs", true) !== false && String(setting("cacheSongs", true)) !== "false"
+  // `omarchy bar set` stores strings; clamp again because the schema's
+  // min/max only limit the settings UI.
+  readonly property int cacheLimitMB: Math.max(100, Math.min(20000, parseInt(setting("cacheLimitMB", 1024), 10) || 1024))
 
   readonly property bool hasTrack: service ? service.hasTrack : false
   readonly property bool playing: service ? service.playing : false
@@ -35,11 +40,18 @@ BarWidget {
   }
 
   function pushSettings() {
-    if (service) service.autoRadio = root.autoRadio
+    if (!service) return
+    service.autoRadio = root.autoRadio
+    service.saveHistory = root.saveHistory
+    service.cacheSongs = root.cacheSongs
+    service.cacheLimitMB = root.cacheLimitMB
   }
 
   onServiceChanged: pushSettings()
   onAutoRadioChanged: pushSettings()
+  onSaveHistoryChanged: pushSettings()
+  onCacheSongsChanged: pushSettings()
+  onCacheLimitMBChanged: pushSettings()
 
   // ---- Panel contract (same shape as the first-party clock).
   readonly property bool opened: panelLoader.item ? panelLoader.item.opened === true : false

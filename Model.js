@@ -13,6 +13,11 @@ var MAX_QUEUE = 500
 var MAX_REPLY_BYTES = 262144
 var VIDEO_ID = /^[A-Za-z0-9_-]{11}$/
 var WATCH_PREFIX = "https://music.youtube.com/watch?v="
+var MAX_HISTORY = 50
+var MAX_SAVED_QUEUE = 200
+// One argv string can't exceed 128 KiB on Linux; stay well under it.
+var MAX_SAVE_BYTES = 100000
+var CACHE_EXT = /^(webm|m4a)$/
 
 // Control, bidi-override and markup characters are dropped before any string
 // reaches a label, a tooltip or mpv's media title (which MPRIS republishes).
@@ -32,11 +37,34 @@ function watchUrl(id) {
   return isVideoId(id) ? WATCH_PREFIX + id : ""
 }
 
-function idFromUrl(url) {
+// The cache directory comes from the storage helper. It must be a plain
+// absolute path; anything odd disables cached playback rather than being
+// handed to mpv.
+function validCacheDir(dir) {
+  return typeof dir === "string" && /^\/[A-Za-z0-9._\/-]{1,300}$/.test(dir) && dir.indexOf("/../") < 0 && !/\/\.\.?$/.test(dir)
+}
+
+// Maps an mpv playlist filename back to a video id: our watch URLs, and
+// files inside the cache directory named <id>.webm or <id>.m4a.
+function idFromUrl(url, cacheDir) {
   var s = String(url || "")
-  if (s.indexOf(WATCH_PREFIX) !== 0) return ""
-  var id = s.slice(WATCH_PREFIX.length)
-  return isVideoId(id) ? id : ""
+  if (s.indexOf(WATCH_PREFIX) === 0) {
+    var id = s.slice(WATCH_PREFIX.length)
+    return isVideoId(id) ? id : ""
+  }
+  if (validCacheDir(cacheDir) && s.indexOf(cacheDir + "/") === 0) {
+    var m = /^([A-Za-z0-9_-]{11})\.(webm|m4a)$/.exec(s.slice(cacheDir.length + 1))
+    return m ? m[1] : ""
+  }
+  return ""
+}
+
+// Where mpv should load a track from: the cached file when there is one,
+// otherwise YouTube Music.
+function sourceFor(track, cached, cacheDir) {
+  var hit = track && cached ? cached[track.id] : null
+  if (hit && CACHE_EXT.test(hit.ext) && validCacheDir(cacheDir)) return cacheDir + "/" + track.id + "." + hit.ext
+  return watchUrl(track ? track.id : "")
 }
 
 function cleanTrack(raw) {
@@ -51,24 +79,133 @@ function cleanTrack(raw) {
   }
 }
 
-// Parses one line of backend output. Anything that is not the documented
-// shape becomes an error rather than a partly-trusted object.
-function parseReply(text) {
+// Parses one line of helper output into { ok, data } or { ok: false, error }.
+// Anything that is not the documented shape becomes an error rather than a
+// partly-trusted object.
+function parseJsonReply(text) {
   var s = String(text || "").trim()
   if (s === "") return { ok: false, error: "The helper script returned nothing. Check it is executable." }
   if (s.length > MAX_REPLY_BYTES) return { ok: false, error: "The helper script returned too much data." }
   var data
   try { data = JSON.parse(s) } catch (e) { return { ok: false, error: "The helper script returned something that isn't JSON." } }
-  if (!data || typeof data !== "object") return { ok: false, error: "The helper script returned an unexpected reply." }
+  if (!data || typeof data !== "object" || Array.isArray(data)) return { ok: false, error: "The helper script returned an unexpected reply." }
   if (data.ok !== true) return { ok: false, error: plain(data.error, 300) || "Something went wrong." }
+  return { ok: true, data: data }
+}
+
+function cleanTracks(list, max) {
   var tracks = []
-  if (Array.isArray(data.tracks)) {
-    for (var i = 0; i < data.tracks.length && tracks.length < MAX_TRACKS; i++) {
-      var t = cleanTrack(data.tracks[i])
-      if (t) tracks.push(t)
-    }
+  if (!Array.isArray(list)) return tracks
+  for (var i = 0; i < list.length && tracks.length < max; i++) {
+    var t = cleanTrack(list[i])
+    if (t) tracks.push(t)
   }
-  return { ok: true, tracks: tracks }
+  return tracks
+}
+
+// search / radio: { ok, tracks }
+function parseReply(text) {
+  var r = parseJsonReply(text)
+  if (!r.ok) return r
+  return { ok: true, tracks: cleanTracks(r.data.tracks, MAX_TRACKS) }
+}
+
+// history-*: { ok, history: [query, …] }
+function parseHistory(text) {
+  var r = parseJsonReply(text)
+  if (!r.ok) return r
+  var out = []
+  var list = Array.isArray(r.data.history) ? r.data.history : []
+  for (var i = 0; i < list.length && out.length < MAX_HISTORY; i++) {
+    var q = plain(list[i], 200).trim()
+    if (typeof list[i] === "string" && q !== "") out.push(q)
+  }
+  return { ok: true, history: out }
+}
+
+// queue-get: { ok, queue: { tracks, index, position } }
+function parseQueue(text) {
+  var r = parseJsonReply(text)
+  if (!r.ok) return r
+  var q = r.data.queue && typeof r.data.queue === "object" ? r.data.queue : {}
+  var tracks = cleanTracks(q.tracks, MAX_SAVED_QUEUE)
+  var index = Number(q.index)
+  var position = Number(q.position)
+  return {
+    ok: true,
+    tracks: tracks,
+    index: Number.isInteger(index) && index >= 0 && index < tracks.length ? index : 0,
+    position: isFinite(position) && position >= 0 && position < 86400 ? position : 0
+  }
+}
+
+// cache-list / cache-fetch / cache-clear: { ok, dir, tracks | cached, bytes }
+function parseCache(text) {
+  var r = parseJsonReply(text)
+  if (!r.ok) return r
+  var list = Array.isArray(r.data.tracks) ? r.data.tracks : (r.data.cached ? [r.data.cached] : [])
+  var tracks = []
+  for (var i = 0; i < list.length && tracks.length < 300; i++) {
+    var t = cleanTrack(list[i])
+    var ext = list[i] ? list[i].ext : ""
+    var size = Number(list[i] ? list[i].size : 0)
+    if (!t || typeof ext !== "string" || !CACHE_EXT.test(ext)) continue
+    t.ext = ext
+    t.size = isFinite(size) && size >= 0 ? size : 0
+    tracks.push(t)
+  }
+  var bytes = Number(r.data.bytes)
+  return {
+    ok: true,
+    dir: validCacheDir(r.data.dir) ? r.data.dir : "",
+    tracks: tracks,
+    bytes: isFinite(bytes) && bytes >= 0 ? bytes : -1
+  }
+}
+
+function cacheMap(tracks) {
+  var map = Object.create(null)
+  for (var i = 0; i < tracks.length; i++) map[tracks[i].id] = tracks[i]
+  return map
+}
+
+function formatBytes(n) {
+  var v = Number(n)
+  if (!isFinite(v) || v < 0) return ""
+  if (v < 1024 * 1024) return Math.round(v / 1024) + " KB"
+  if (v < 1024 * 1024 * 1024) return (v / 1048576).toFixed(v < 10485760 ? 1 : 0) + " MB"
+  return (v / 1073741824).toFixed(1) + " GB"
+}
+
+// Search history, most recent first, without case-insensitive duplicates.
+function pushHistory(history, query) {
+  var q = plain(query, 200).trim()
+  if (q === "") return history.slice(0, MAX_HISTORY)
+  var out = [q]
+  for (var i = 0; i < history.length && out.length < MAX_HISTORY; i++)
+    if (history[i].toLowerCase() !== q.toLowerCase()) out.push(history[i])
+  return out
+}
+
+// The queue as saved to disk. When it would be too big for one argv
+// string, keep a window of songs around the current one.
+function queueSnapshot(rows, index, position) {
+  var tracks = []
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i]
+    if (r && isVideoId(r.id)) tracks.push({ id: r.id, title: r.title, artist: r.artist || "", album: r.album || "", duration: r.duration || "" })
+  }
+  var at = Math.max(0, Math.min(tracks.length - 1, index | 0))
+  var start = Math.max(0, at - 20)
+  var end = Math.min(tracks.length, start + MAX_SAVED_QUEUE)
+  var pos = Number(position)
+  pos = isFinite(pos) && pos > 0 ? Math.round(pos * 10) / 10 : 0
+  for (;;) {
+    var text = JSON.stringify({ tracks: tracks.slice(start, end), index: at - start, position: pos })
+    if (utf8Length(text) <= MAX_SAVE_BYTES || end - start <= 1) return text
+    end = start + Math.max(1, Math.floor((end - start) * 0.75))
+    if (at >= end) { start = at; end = at + 1 }
+  }
 }
 
 function displayTitle(track) {
@@ -91,10 +228,15 @@ function utf8Length(s) {
   return n
 }
 
-function loadfileCommand(track, mode) {
+// `source` defaults to the watch URL; `startSeconds` resumes part-way in.
+function loadfileCommand(track, mode, source, startSeconds) {
   var title = plain(displayTitle(track), MAX_TITLE + MAX_ARTIST + 3)
-  var flags = mode === "replace" ? "replace" : "append-play"
-  return ["loadfile", watchUrl(track.id), flags, -1, "force-media-title=%" + utf8Length(title) + "%" + title]
+  // "append-idle" adds without starting playback (used when restoring).
+  var flags = mode === "replace" ? "replace" : (mode === "append-idle" ? "append" : "append-play")
+  var options = ["force-media-title=%" + utf8Length(title) + "%" + title]
+  var start = Number(startSeconds)
+  if (isFinite(start) && start >= 1) options.push("start=" + Math.floor(start))
+  return ["loadfile", source || watchUrl(track.id), flags, -1, options.join(",")]
 }
 
 function rememberTracks(meta, tracks) {
@@ -106,18 +248,19 @@ function rememberTracks(meta, tracks) {
 
 // Turns mpv's playlist into rows for the panel. Entries that are not our
 // watch URLs (something else loaded into this mpv) are shown by filename.
-function buildQueue(playlist, meta) {
+function buildQueue(playlist, meta, cacheDir) {
   var rows = []
   if (!Array.isArray(playlist)) return rows
   for (var i = 0; i < playlist.length && i < MAX_QUEUE; i++) {
     var entry = playlist[i] || {}
-    var id = idFromUrl(entry.filename)
+    var id = idFromUrl(entry.filename, cacheDir)
     var known = id && meta ? meta[id] : null
     rows.push({
       index: i,
       id: id,
       title: known ? known.title : plain(entry.title || entry.filename || "Unknown track", MAX_TITLE),
       artist: known ? known.artist : "",
+      album: known ? known.album : "",
       duration: known ? known.duration : "",
       current: entry.current === true
     })
@@ -166,6 +309,9 @@ function playbackError(event, track) {
 if (typeof module !== "undefined") {
   module.exports = {
     plain: plain, isVideoId: isVideoId, watchUrl: watchUrl, idFromUrl: idFromUrl,
+    validCacheDir: validCacheDir, sourceFor: sourceFor, parseHistory: parseHistory,
+    parseQueue: parseQueue, parseCache: parseCache, cacheMap: cacheMap,
+    formatBytes: formatBytes, pushHistory: pushHistory, queueSnapshot: queueSnapshot,
     cleanTrack: cleanTrack, parseReply: parseReply, displayTitle: displayTitle,
     utf8Length: utf8Length, loadfileCommand: loadfileCommand, rememberTracks: rememberTracks,
     buildQueue: buildQueue, radioAdditions: radioAdditions, formatTime: formatTime,

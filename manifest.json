@@ -2,12 +2,12 @@
   "schemaVersion": 1,
   "id": "codydon.omatune",
   "name": "OmaTune",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "author": "codydon",
   "license": "MIT",
   "homepage": "https://github.com/codydon/omatune",
   "repository": "https://github.com/codydon/omatune",
-  "description": "Search and play YouTube Music without an account, ArchiveTune style: anonymous InnerTube search, automatic song radio, and playback through mpv and yt-dlp.",
+  "description": "Search and play YouTube Music without an account, ArchiveTune style: anonymous InnerTube search, song radio, search history, a resumable queue and an offline song cache, played through mpv and yt-dlp.",
   "keywords": [
     "omatune",
     "music",
@@ -34,7 +34,10 @@
     "defaults": {
       "showTitle": true,
       "maxTitleChars": 28,
-      "autoRadio": true
+      "autoRadio": true,
+      "saveHistory": true,
+      "cacheSongs": true,
+      "cacheLimitMB": 1024
     },
     "schema": [
       {
@@ -65,6 +68,35 @@
           false
         ],
         "defaultValue": true
+      },
+      {
+        "key": "saveHistory",
+        "type": "enum",
+        "label": "Remember searches",
+        "options": [
+          true,
+          false
+        ],
+        "defaultValue": true
+      },
+      {
+        "key": "cacheSongs",
+        "type": "enum",
+        "label": "Save songs you play for offline listening",
+        "options": [
+          true,
+          false
+        ],
+        "defaultValue": true
+      },
+      {
+        "key": "cacheLimitMB",
+        "type": "integer",
+        "label": "Offline cache size (MB)",
+        "min": 100,
+        "max": 20000,
+        "step": 100,
+        "defaultValue": 1024
       }
     ]
   }

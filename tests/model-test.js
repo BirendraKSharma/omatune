@@ -93,4 +93,78 @@ test("formatTime and clampIndex", () => {
   assert.equal(M.clampIndex(0, 0), -1)
 })
 
+const CACHE = "/home/me/.cache/codydon-omatune/audio"
+
+test("cached tracks play from disk, everything else from YouTube", () => {
+  const cached = M.cacheMap([{ id: "wU26xVT_vBU", ext: "webm" }])
+  assert.equal(M.sourceFor({ id: "wU26xVT_vBU" }, cached, CACHE), CACHE + "/wU26xVT_vBU.webm")
+  assert.equal(M.sourceFor({ id: "Rgrt_8mXrK8" }, cached, CACHE), "https://music.youtube.com/watch?v=Rgrt_8mXrK8")
+  assert.equal(M.sourceFor({ id: "wU26xVT_vBU" }, cached, "relative/dir"), "https://music.youtube.com/watch?v=wU26xVT_vBU")
+  assert.equal(M.sourceFor({ id: "wU26xVT_vBU" }, M.cacheMap([{ id: "wU26xVT_vBU", ext: "sh" }]), CACHE), "https://music.youtube.com/watch?v=wU26xVT_vBU")
+})
+
+test("cache directories must be plain absolute paths", () => {
+  assert.equal(M.validCacheDir(CACHE), true)
+  for (const bad of ["", "cache", "/a/../b", "/a/..", "/a b", "/a\nb", "/a,b", 5])
+    assert.equal(M.validCacheDir(bad), false, String(bad))
+})
+
+test("idFromUrl understands cached file paths", () => {
+  assert.equal(M.idFromUrl(CACHE + "/wU26xVT_vBU.webm", CACHE), "wU26xVT_vBU")
+  assert.equal(M.idFromUrl(CACHE + "/wU26xVT_vBU.m4a", CACHE), "wU26xVT_vBU")
+  assert.equal(M.idFromUrl(CACHE + "/wU26xVT_vBU.mp3", CACHE), "")
+  assert.equal(M.idFromUrl("/elsewhere/wU26xVT_vBU.webm", CACHE), "")
+  assert.equal(M.idFromUrl(CACHE + "/sub/wU26xVT_vBU.webm", CACHE), "")
+})
+
+test("loadfileCommand adds a resume offset and supports idle appends", () => {
+  const t = { id: "wU26xVT_vBU", title: "One", artist: "" }
+  const cmd = M.loadfileCommand(t, "append-idle", CACHE + "/wU26xVT_vBU.webm", 83.7)
+  assert.deepEqual(cmd.slice(0, 4), ["loadfile", CACHE + "/wU26xVT_vBU.webm", "append", -1])
+  assert.equal(cmd[4], "force-media-title=%3%One,start=83")
+  assert.equal(M.loadfileCommand(t, "append-idle", "", 0.5)[4], "force-media-title=%3%One")
+})
+
+test("parseHistory, parseQueue and parseCache only accept the documented shapes", () => {
+  assert.deepEqual(M.parseHistory('{"ok":true,"history":["a <b>", 5, "", "c"]}').history, ["a b", "c"])
+  const q = M.parseQueue('{"ok":true,"queue":{"tracks":[{"id":"wU26xVT_vBU","title":"x"},{"id":"bad"}],"index":9,"position":-4}}')
+  assert.equal(q.tracks.length, 1)
+  assert.equal(q.index, 0)
+  assert.equal(q.position, 0)
+  const c = M.parseCache('{"ok":true,"dir":"' + CACHE + '","bytes":10,"tracks":[{"id":"wU26xVT_vBU","title":"x","ext":"webm","size":10},{"id":"Rgrt_8mXrK8","ext":"exe"}]}')
+  assert.equal(c.dir, CACHE)
+  assert.deepEqual(c.tracks.map(t => t.id), ["wU26xVT_vBU"])
+  assert.equal(M.parseCache('{"ok":true,"dir":"../x","tracks":[]}').dir, "")
+  assert.equal(M.parseCache('{"ok":true,"dir":"' + CACHE + '","cached":{"id":"wU26xVT_vBU","title":"x","ext":"m4a","size":1}}').tracks[0].ext, "m4a")
+  assert.equal(M.parseQueue('{"ok":false,"error":"nope"}').ok, false)
+})
+
+test("pushHistory keeps the newest first without case-insensitive duplicates", () => {
+  let h = []
+  for (const q of ["daft punk", "Future", "DAFT PUNK", "  "]) h = M.pushHistory(h, q)
+  assert.deepEqual(h, ["DAFT PUNK", "Future"])
+  for (let i = 0; i < 80; i++) h = M.pushHistory(h, "q" + i)
+  assert.equal(h.length, 50)
+  assert.equal(h[0], "q79")
+})
+
+test("queueSnapshot stays under the argv limit and keeps the current song", () => {
+  const rows = []
+  for (let i = 0; i < 400; i++) rows.push({ id: ("A" + String(i).padStart(10, "0")).slice(0, 11), title: "T".repeat(190), artist: "A".repeat(110), duration: "3:00" })
+  const snap = JSON.parse(M.queueSnapshot(rows, 350, 42.26))
+  assert.ok(Buffer.byteLength(M.queueSnapshot(rows, 350, 42.26)) <= 100000)
+  assert.equal(snap.tracks[snap.index].id, rows[350].id)
+  assert.equal(snap.position, 42.3)
+  const small = JSON.parse(M.queueSnapshot(rows.slice(0, 3), 1, NaN))
+  assert.equal(small.tracks.length, 3)
+  assert.equal(small.index, 1)
+  assert.equal(small.position, 0)
+})
+
+test("formatBytes", () => {
+  assert.equal(M.formatBytes(5319766), "5.1 MB")
+  assert.equal(M.formatBytes(2 * 1073741824), "2.0 GB")
+  assert.equal(M.formatBytes(-1), "")
+})
+
 console.log(`model-test: ${passed} passed`)

@@ -1,0 +1,618 @@
+#!/usr/bin/python3 -I -S
+"""OmaTune's local storage: search history, the saved queue and the audio cache.
+
+Every command prints exactly one line of JSON on stdout:
+{"ok": true, ...} or {"ok": false, "error": "..."}.
+
+  ytm-store history-get
+  ytm-store history-add <query>
+  ytm-store history-remove <query>
+  ytm-store history-clear
+  ytm-store queue-get
+  ytm-store queue-put <json>            {"tracks": [...], "index": n, "position": s}
+  ytm-store cache-list
+  ytm-store cache-fetch <limit-mb> <id> <title> <artist> <album> <duration>
+  ytm-store cache-touch <id>
+  ytm-store cache-clear
+
+Files live in two directories this script creates and owns:
+  $XDG_STATE_HOME/codydon-omatune/          history.json, queue.json
+  $XDG_CACHE_HOME/codydon-omatune/audio/    <id>.webm|m4a and <id>.json
+
+File rules (from the Omarchy marketplace security review):
+- Directories are walked from $HOME with held descriptors and O_NOFOLLOW,
+  must be owned by the user, and the two plugin-owned ones are forced 0700.
+- Reads go through one O_NOFOLLOW|O_NONBLOCK descriptor, fstat-checked as a
+  regular file, reading at most cap + 1 bytes.
+- Writes go to an exclusive random temporary (0600) in the same directory,
+  are fsynced, renamed over the target, and the directory is fsynced.
+- Deletes only touch exact names that match the patterns below.
+"""
+
+import json
+import os
+import re
+import secrets
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+APP = "codydon-omatune"
+VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
+AUDIO_NAME = re.compile(r"([A-Za-z0-9_-]{11})\.(webm|m4a)")
+META_NAME = re.compile(r"([A-Za-z0-9_-]{11})\.json")
+TMP_NAME = re.compile(r"\.tmp-[0-9a-f]{16}(\.[a-z0-9]{1,5})?")
+DURATION = re.compile(r"\d{1,2}(:\d{2}){1,2}")
+CONTROL = re.compile("[\\x00-\\x1f\\x7f-\\x9f\\u202a-\\u202e\\u2066-\\u2069]")
+
+YTDLP = "/usr/bin/yt-dlp"
+MAX_STATE_BYTES = 262144
+MAX_META_BYTES = 4096
+MAX_HISTORY = 50
+MAX_QUERY = 200
+MAX_QUEUE = 200
+MAX_TITLE = 200
+MAX_ARTIST = 120
+MAX_CACHE_FILES = 5000
+MAX_CACHE_LIST = 300
+STALE_TMP_SECONDS = 600
+MAX_SONG_BYTES = 60 * 1024 * 1024
+FETCH_DEADLINE = 300
+
+
+class Refused(Exception):
+    """A user-facing failure; the message is shown in the panel."""
+
+
+def reply(**fields):
+    sys.stdout.write(json.dumps(dict(ok=True, **fields), separators=(",", ":")) + "\n")
+
+
+def fail(message):
+    sys.stdout.write(json.dumps({"ok": False, "error": message}) + "\n")
+
+
+def clean(value, limit):
+    text = CONTROL.sub("", str(value if value is not None else ""))
+    return text[:limit]
+
+
+# ------------------------------------------------------------------ dirs
+
+def _base_dir(env_name, fallback):
+    """$XDG_*_HOME if it is an absolute path, else $HOME/<fallback>."""
+    home = os.environ.get("HOME", "")
+    if not home.startswith("/"):
+        raise Refused("HOME isn't set, so there's nowhere to keep OmaTune's files.")
+    value = os.environ.get(env_name, "")
+    if value.startswith("/"):
+        return value
+    return os.path.join(home, fallback)
+
+
+class Missing(Exception):
+    """A storage directory doesn't exist yet (reads treat this as empty)."""
+
+
+def _open_dir_chain(path, own_from, create):
+    """Open `path` one component at a time without following symlinks.
+
+    Components from index `own_from` on are plugin-owned: created if
+    missing and forced to 0700. Every component from $HOME down (or, for a
+    base outside $HOME, the base itself) must be owned by us; the system
+    directories above it are root's. Returns an O_DIRECTORY descriptor.
+    """
+    parts = [p for p in path.split("/") if p]
+    if any(p in (".", "..") for p in parts):
+        raise Refused("A storage path contains '.' or '..'.")
+    home_parts = [p for p in os.environ.get("HOME", "").split("/") if p]
+    check_from = len(home_parts) - 1 if parts[:len(home_parts)] == home_parts else own_from - 1
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    uid = os.geteuid()
+    try:
+        for i, part in enumerate(parts):
+            owned = i >= own_from
+            # XDG base directories below $HOME are created 0700 if missing,
+            # but only the plugin's own directories get their mode forced.
+            if create and (owned or i > check_from):
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            try:
+                nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            except FileNotFoundError:
+                if create:
+                    raise
+                raise Missing()
+            os.close(fd)
+            fd = nxt
+            st = os.fstat(fd)
+            if i >= check_from and st.st_uid != uid:
+                raise Refused("A storage directory isn't owned by you.")
+            if owned:
+                os.fchmod(fd, 0o700)
+        return fd
+    except OSError as exc:
+        os.close(fd)
+        raise Refused("Couldn't open OmaTune's storage folder (%s)." % exc.strerror)
+    except (Refused, Missing):
+        os.close(fd)
+        raise
+
+
+def state_dir(create=True):
+    base = _base_dir("XDG_STATE_HOME", ".local/state")
+    return _open_dir_chain(os.path.join(base, APP), len([p for p in base.split("/") if p]), create)
+
+
+def cache_path():
+    return os.path.join(_base_dir("XDG_CACHE_HOME", ".cache"), APP, "audio")
+
+
+def cache_dir(create=True):
+    base = _base_dir("XDG_CACHE_HOME", ".cache")
+    path = cache_path()
+    return _open_dir_chain(path, len([p for p in base.split("/") if p]), create), path
+
+
+# ------------------------------------------------------------------ files
+
+def read_bytes(dir_fd, name, cap):
+    """Return the file's bytes, or None if it doesn't exist. Refuses links,
+    FIFOs, devices and anything over `cap`."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise Refused("A saved file is not a plain file, so it was left alone.")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+            raise Refused("A saved file is not a plain file you own, so it was left alone.")
+        chunks, total = [], 0
+        while total <= cap:
+            chunk = os.read(fd, min(65536, cap + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total > cap:
+            raise Refused("A saved file is larger than expected, so it was ignored.")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def read_head(dir_fd, name, count):
+    """First `count` bytes of a regular file we own, via one O_NOFOLLOW fd."""
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+            return b"", st
+        return os.read(fd, count), st
+    finally:
+        os.close(fd)
+
+
+def read_json(dir_fd, name, cap):
+    data = read_bytes(dir_fd, name, cap)
+    if data is None:
+        return None
+    try:
+        return json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+
+
+def write_atomic(dir_fd, name, data):
+    tmp = ".tmp-" + secrets.token_hex(8)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dir_fd)
+    try:
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
+        os.fsync(fd)
+    except BaseException:
+        os.close(fd)
+        os.unlink(tmp, dir_fd=dir_fd)
+        raise
+    os.close(fd)
+    os.rename(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    os.fsync(dir_fd)
+
+
+def write_json(dir_fd, name, value):
+    write_atomic(dir_fd, name, (json.dumps(value, separators=(",", ":")) + "\n").encode("utf-8"))
+
+
+def unlink_quiet(dir_fd, name):
+    try:
+        os.unlink(name, dir_fd=dir_fd)
+    except FileNotFoundError:
+        pass
+
+
+# ------------------------------------------------------------------ tracks
+
+def clean_track(raw):
+    if not isinstance(raw, dict) or not isinstance(raw.get("id"), str) or not VIDEO_ID.fullmatch(raw["id"]):
+        return None
+    duration = raw.get("duration")
+    return {
+        "id": raw["id"],
+        "title": clean(raw.get("title"), MAX_TITLE) or raw["id"],
+        "artist": clean(raw.get("artist"), MAX_ARTIST),
+        "album": clean(raw.get("album"), MAX_ARTIST),
+        "duration": duration if isinstance(duration, str) and DURATION.fullmatch(duration) else "",
+    }
+
+
+def finite_number(value, low, high, default):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    if value != value or value in (float("inf"), float("-inf")):
+        return default
+    return max(low, min(high, value))
+
+
+# ------------------------------------------------------------------ history
+
+def load_history(dfd):
+    data = read_json(dfd, "history.json", MAX_STATE_BYTES)
+    queries = data.get("queries") if isinstance(data, dict) else None
+    out = []
+    for q in queries if isinstance(queries, list) else []:
+        if isinstance(q, str):
+            q = clean(q, MAX_QUERY).strip()
+            if q and q.casefold() not in (x.casefold() for x in out):
+                out.append(q)
+        if len(out) >= MAX_HISTORY:
+            break
+    return out
+
+
+def cmd_history_get(args):
+    try:
+        dfd = state_dir(create=False)
+    except Missing:
+        reply(history=[])
+        return
+    try:
+        reply(history=load_history(dfd))
+    finally:
+        os.close(dfd)
+
+
+def cmd_history_add(args):
+    query = clean(args[0] if args else "", MAX_QUERY).strip()
+    if not query:
+        raise Refused("There's no search to remember.")
+    dfd = state_dir()
+    try:
+        history = [q for q in load_history(dfd) if q.casefold() != query.casefold()]
+        history = ([query] + history)[:MAX_HISTORY]
+        write_json(dfd, "history.json", {"v": 1, "queries": history})
+        reply(history=history)
+    finally:
+        os.close(dfd)
+
+
+def cmd_history_remove(args):
+    query = clean(args[0] if args else "", MAX_QUERY).strip()
+    try:
+        dfd = state_dir(create=False)
+    except Missing:
+        reply(history=[])
+        return
+    try:
+        history = [q for q in load_history(dfd) if q.casefold() != query.casefold()]
+        write_json(dfd, "history.json", {"v": 1, "queries": history})
+        reply(history=history)
+    finally:
+        os.close(dfd)
+
+
+def cmd_history_clear(args):
+    try:
+        dfd = state_dir(create=False)
+    except Missing:
+        reply(history=[])
+        return
+    try:
+        unlink_quiet(dfd, "history.json")
+        reply(history=[])
+    finally:
+        os.close(dfd)
+
+
+# ------------------------------------------------------------------ queue
+
+def normalise_queue(raw):
+    raw = raw if isinstance(raw, dict) else {}
+    tracks = []
+    for t in raw.get("tracks") if isinstance(raw.get("tracks"), list) else []:
+        t = clean_track(t)
+        if t:
+            tracks.append(t)
+        if len(tracks) >= MAX_QUEUE:
+            break
+    index = int(finite_number(raw.get("index"), 0, max(0, len(tracks) - 1), 0))
+    position = float(finite_number(raw.get("position"), 0, 86400, 0))
+    return {"tracks": tracks, "index": index, "position": round(position, 1)}
+
+
+def cmd_queue_get(args):
+    try:
+        dfd = state_dir(create=False)
+    except Missing:
+        reply(queue=normalise_queue(None))
+        return
+    try:
+        data = read_json(dfd, "queue.json", MAX_STATE_BYTES)
+        reply(queue=normalise_queue(data))
+    finally:
+        os.close(dfd)
+
+
+def cmd_queue_put(args):
+    text = args[0] if args else ""
+    if len(text.encode("utf-8")) > MAX_STATE_BYTES:
+        raise Refused("The queue is too large to save.")
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise Refused("The queue to save wasn't valid JSON.")
+    queue = normalise_queue(data)
+    dfd = state_dir()
+    try:
+        if queue["tracks"]:
+            write_json(dfd, "queue.json", dict(v=1, **queue))
+        else:
+            unlink_quiet(dfd, "queue.json")
+        reply(saved=len(queue["tracks"]))
+    finally:
+        os.close(dfd)
+
+
+# ------------------------------------------------------------------ cache
+
+def scan_cache(dfd):
+    """Return {id: {"ext", "size", "mtime"}} for well-formed audio files."""
+    found = {}
+    count = 0
+    with os.scandir(dfd) as entries:
+        for entry in entries:
+            count += 1
+            if count > MAX_CACHE_FILES:
+                break
+            m = AUDIO_NAME.fullmatch(entry.name)
+            if not m:
+                continue
+            try:
+                st = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode) and st.st_uid == os.geteuid():
+                found[m.group(1)] = {"ext": m.group(2), "size": st.st_size, "mtime": st.st_mtime}
+    return found
+
+
+def cached_tracks(dfd, files):
+    out = []
+    newest = sorted(files.items(), key=lambda kv: kv[1]["mtime"], reverse=True)[:MAX_CACHE_LIST]
+    for vid, info in newest:
+        meta = clean_track(read_json(dfd, vid + ".json", MAX_META_BYTES)) or {"id": vid, "title": vid, "artist": "", "album": "", "duration": ""}
+        meta["id"] = vid
+        meta["ext"] = info["ext"]
+        meta["size"] = info["size"]
+        out.append(meta)
+    return out
+
+
+def prune(dfd, limit_bytes):
+    files = scan_cache(dfd)
+    total = sum(f["size"] for f in files.values())
+    for vid, info in sorted(files.items(), key=lambda kv: kv[1]["mtime"]):
+        if total <= limit_bytes:
+            break
+        unlink_quiet(dfd, "%s.%s" % (vid, info["ext"]))
+        unlink_quiet(dfd, vid + ".json")
+        total -= info["size"]
+    # Leftovers from an interrupted fetch or write, once they're clearly old.
+    cutoff = time.time() - STALE_TMP_SECONDS
+    stale = []
+    with os.scandir(dfd) as entries:
+        for e in entries:
+            if TMP_NAME.fullmatch(e.name):
+                try:
+                    st = e.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if stat.S_ISREG(st.st_mode) and st.st_mtime < cutoff:
+                    stale.append(e.name)
+    for name in stale[:MAX_CACHE_FILES]:
+        unlink_quiet(dfd, name)
+
+
+def cmd_cache_list(args):
+    try:
+        dfd, path = cache_dir(create=False)
+    except Missing:
+        reply(dir=cache_path(), tracks=[], bytes=0)
+        return
+    try:
+        files = scan_cache(dfd)
+        reply(dir=path, tracks=cached_tracks(dfd, files), bytes=sum(f["size"] for f in files.values()))
+    finally:
+        os.close(dfd)
+
+
+def cmd_cache_touch(args):
+    vid = args[0] if args else ""
+    if not VIDEO_ID.fullmatch(vid):
+        raise Refused("That isn't a YouTube video id.")
+    try:
+        dfd, _ = cache_dir(create=False)
+    except Missing:
+        reply()
+        return
+    try:
+        for ext in ("webm", "m4a"):
+            try:
+                os.utime(vid + "." + ext, dir_fd=dfd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+        reply()
+    finally:
+        os.close(dfd)
+
+
+def cmd_cache_clear(args):
+    try:
+        dfd, _ = cache_dir(create=False)
+    except Missing:
+        reply(tracks=[], bytes=0)
+        return
+    try:
+        names = []
+        with os.scandir(dfd) as entries:
+            for e in entries:
+                if len(names) >= MAX_CACHE_FILES:
+                    break
+                if not (AUDIO_NAME.fullmatch(e.name) or META_NAME.fullmatch(e.name) or TMP_NAME.fullmatch(e.name)):
+                    continue
+                try:
+                    st = e.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                # Only regular files we own: never links or anything planted.
+                if stat.S_ISREG(st.st_mode) and st.st_uid == os.geteuid():
+                    names.append(e.name)
+        for name in names:
+            unlink_quiet(dfd, name)
+        reply(tracks=[], bytes=0)
+    finally:
+        os.close(dfd)
+
+
+def looks_like_audio(data, ext):
+    if ext == "webm":
+        return data[:4] == b"\x1a\x45\xdf\xa3"
+    return data[4:8] == b"ftyp"
+
+
+def run_ytdlp(vid, out_template):
+    """Download one song's best audio, bounded in time and size, in its own
+    process group so the whole tree is killed at the deadline."""
+    argv = [
+        YTDLP, "--ignore-config", "--no-playlist", "--no-progress", "--quiet",
+        "--no-mtime", "--no-part", "--no-write-thumbnail", "--no-exec",
+        "--max-filesize", str(MAX_SONG_BYTES),
+        "--socket-timeout", "20",
+        "-f", "bestaudio[ext=webm]/bestaudio[ext=m4a]",
+        "-o", out_template,
+        "--", "https://music.youtube.com/watch?v=" + vid,
+    ]
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+    try:
+        return proc.wait(timeout=FETCH_DEADLINE) == 0
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+        return False
+
+
+def cmd_cache_fetch(args):
+    if len(args) != 6:
+        raise Refused("cache-fetch needs a size limit and five track fields.")
+    try:
+        limit_mb = int(args[0]) if re.fullmatch(r"\d{1,6}", args[0]) else -1
+    except ValueError:
+        limit_mb = -1
+    if limit_mb <= 0:
+        raise Refused("Caching is turned off.")
+    track = clean_track({"id": args[1], "title": args[2], "artist": args[3], "album": args[4], "duration": args[5]})
+    if not track:
+        raise Refused("That isn't a YouTube video id.")
+    vid = track["id"]
+    dfd, path = cache_dir()
+    try:
+        existing = scan_cache(dfd).get(vid)
+        if existing:
+            reply(cached=dict(track, ext=existing["ext"], size=existing["size"]), dir=path)
+            return
+        stem = ".tmp-" + secrets.token_hex(8)
+        ok = run_ytdlp(vid, os.path.join(path, stem + ".%(ext)s"))
+        # Find what yt-dlp wrote, by exact name, inside our directory.
+        result = None
+        for ext in ("webm", "m4a"):
+            try:
+                st = os.stat(stem + "." + ext, dir_fd=dfd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            result = (ext, st)
+            break
+        if not ok or result is None:
+            for ext in ("webm", "m4a"):
+                unlink_quiet(dfd, stem + "." + ext)
+            raise Refused("Couldn't save this song for offline use. It still plays online.")
+        ext, _ = result
+        name = stem + "." + ext
+        head, st = read_head(dfd, name, 16)
+        if (not stat.S_ISREG(st.st_mode) or st.st_size > MAX_SONG_BYTES
+                or not looks_like_audio(head, ext)):
+            unlink_quiet(dfd, name)
+            raise Refused("The downloaded file didn't look like audio, so it was discarded.")
+        write_json(dfd, vid + ".json", track)
+        os.rename(name, vid + "." + ext, src_dir_fd=dfd, dst_dir_fd=dfd)
+        os.fsync(dfd)
+        prune(dfd, limit_mb * 1024 * 1024)
+        still = scan_cache(dfd).get(vid)
+        if not still:
+            raise Refused("The cache limit is smaller than this song, so it wasn't kept.")
+        reply(cached=dict(track, ext=ext, size=still["size"]), dir=path)
+    finally:
+        os.close(dfd)
+
+
+COMMANDS = {
+    "history-get": cmd_history_get,
+    "history-add": cmd_history_add,
+    "history-remove": cmd_history_remove,
+    "history-clear": cmd_history_clear,
+    "queue-get": cmd_queue_get,
+    "queue-put": cmd_queue_put,
+    "cache-list": cmd_cache_list,
+    "cache-fetch": cmd_cache_fetch,
+    "cache-touch": cmd_cache_touch,
+    "cache-clear": cmd_cache_clear,
+}
+
+
+def main(argv):
+    os.umask(0o077)
+    command = COMMANDS.get(argv[1] if len(argv) > 1 else "")
+    if command is None:
+        fail("Unknown command.")
+        return
+    try:
+        command(argv[2:])
+    except Refused as exc:
+        fail(str(exc))
+    except OSError as exc:
+        fail("Couldn't read or write OmaTune's files (%s)." % (exc.strerror or "error"))
+
+
+if __name__ == "__main__":
+    main(sys.argv)

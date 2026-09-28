@@ -13,10 +13,14 @@ echo "OmaTune checks"
 
 if node tests/model-test.js > /dev/null; then pass "Model.js unit tests"; else fail "Model.js unit tests (run: node tests/model-test.js)"; fi
 
+if bash tests/store-test.sh > /dev/null; then pass "ytm-store tests"; else fail "ytm-store tests (run: bash tests/store-test.sh)"; fi
+
+if python3 -I -S -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' ytm-store; then pass "ytm-store syntax"; else fail "ytm-store syntax"; fi
+
 if bash -n ytm-backend; then pass "ytm-backend syntax"; else fail "ytm-backend syntax"; fi
 
 if command -v shellcheck > /dev/null; then
-  if shellcheck -S warning ytm-backend bin/check; then pass "shellcheck"; else fail "shellcheck"; fi
+  if shellcheck -S warning ytm-backend bin/check tests/store-test.sh; then pass "shellcheck"; else fail "shellcheck"; fi
 else
   skip "shellcheck (not installed)"
 fi
@@ -47,6 +51,11 @@ for f in sorted(glob.glob('*.qml')):
 PY
 )
 if [[ -z $missing ]]; then pass "every Text has textFormat"; else fail "Text without textFormat: $missing"; fi
+
+# No invisible bidi-override or zero-width characters in source ("Trojan
+# Source"); write them as escapes instead.
+hidden=$(grep -rlP '[\x{200B}-\x{200F}\x{202A}-\x{202E}\x{2066}-\x{2069}\x{FEFF}]' --exclude-dir=.git --exclude-dir=.claude --exclude='*.png' . || true)
+if [[ -z $hidden ]]; then pass "no hidden bidi or zero-width characters"; else fail "hidden characters in: $hidden"; fi
 
 # Agent-instruction files must never be committed. Only tracked files count,
 # so a local, gitignored AGENTS.md is fine.
