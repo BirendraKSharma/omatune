@@ -58,7 +58,7 @@ newer yt-dlp fixes. Update yt-dlp and try again before reporting.
 Open a **Feature request** describing the problem you want solved, not only
 the solution. Features that fit well:
 
-- Things ArchiveTune does that OmaTune doesn't yet: offline downloads, local
+- Things ArchiveTune does that OmaTune doesn't yet: local
   playlists, lyrics, album and artist pages.
 - Keyboard-first panel improvements.
 
@@ -67,11 +67,13 @@ default, anything that needs a daemon besides mpv.
 
 ## Development setup
 
-You need an Omarchy install (Omarchy 4 or later, with the Quickshell bar)
-plus the runtime packages:
+You need an Omarchy install (Omarchy 4 or later, with the Quickshell bar).
+Running the plugin needs nothing extra: `mpv`, `yt-dlp`, `mpv-mpris`,
+`curl`, `jq` and `python` all ship with Omarchy (`deno` is optional, for
+yt-dlp's JavaScript challenges). For development and checks you also want:
 
 ```bash
-omarchy pkg add mpv yt-dlp mpv-mpris jq deno nodejs shellcheck
+omarchy pkg add nodejs shellcheck
 ```
 
 Fork the repository and clone your fork somewhere outside the plugin folder:
@@ -95,30 +97,37 @@ Saving QML files under `~/.config/omarchy/plugins/` hot-reloads them, but
 
 ```
 Panel / BarWidget ──► Service.qml ──► ytm-backend ──► music.youtube.com/youtubei/v1
-                          │                └────────► starts / stops mpv
-                          └── mpv JSON IPC socket ──► mpv ──► yt-dlp
+                          │   ├────────► starts / stops mpv
+                          │   └── ytm-store (Python) ──► history, saved queue, offline cache
+                          └── mpv JSON IPC socket ──► mpv ──► yt-dlp ──► stream / saved file
 ```
 
 | File | What it does |
 |---|---|
 | `manifest.json` | Plugin id, kinds (`service` + `bar-widget`) and the settings schema |
-| `Service.qml` | One instance per shell. Holds search state, owns the mpv socket, mirrors mpv's playlist, runs the backend |
+| `Service.qml` | One instance per shell. Holds search state, history, the saved queue and the cache index; owns the mpv socket, mirrors mpv's playlist, runs the backend and the store |
 | `BarWidget.qml` | The bar button (one per monitor), IPC target `codydon.omatune`, hosts the panel |
-| `Panel.qml` | The popup: now playing, seek, transport, search, results and queue |
-| `Model.js` | Pure logic with no Qt or I/O: parsing, cleaning, mpv commands, queue mapping. Unit-tested under node |
+| `Panel.qml` | The popup: now playing, seek, transport, search, and the Results / Queue / Cached / History views |
+| `Model.js` | Pure logic with no Qt or I/O: parsing, cleaning, mpv commands, queue mapping, history / queue / cache helpers. Unit-tested under node |
 | `ytm-backend` | Bash: `search`, `radio <id>` (one JSON line each), and `player`, which execs mpv |
-| `tests/` | Node tests for `Model.js` |
+| `ytm-store` | Python: `history-*`, `queue-get` / `queue-put`, `cache-list` / `cache-fetch` / `cache-touch` / `cache-clear` (one JSON line each). The only writer for state and cached audio |
+| `tests/` | Node tests for `Model.js` (`model-test.js`) and store tests in a throwaway HOME (`store-test.sh`, no network) |
 | `bin/check` | Every local check in one command |
 
-Two design points that surprise people:
+Three design points that surprise people:
 
 - **mpv's playlist is the queue.** The service doesn't keep its own list; it
   mirrors mpv's `playlist` property. `Service.meta` only maps a video id to
-  its title and artist.
+  its title and artist. The saved queue is a snapshot of that, restored on
+  the next launch.
 - **The backend is the only thing that touches the network.** mpv is a
   child `Process` the service owns (`ytm-backend player` execs it), and the
   QML talks to it over its socket. Never detach it: it must stop with the
   plugin.
+- **The store is the only thing that touches saved data.** Reads create
+  nothing; folders and files appear the first time something is saved.
+  Cached playback only uses `<id>.webm` / `<id>.m4a` files inside the cache
+  directory the store reported.
 
 ## Coding rules
 
@@ -164,7 +173,24 @@ blocked real plugins, so pull requests are checked against them.
 
 - Clean it twice: in jq (strip control and bidi characters, cap lengths, cap
   list sizes) and again in `Model.parseReply` / `Model.plain`.
+- History holds at most 50 queries (200 chars each); the saved queue at most
+  200 tracks. Cached playback only uses `<id>.webm` / `<id>.m4a` inside the
+  directory `ytm-store` reported, checked with `Model.validCacheDir` and
+  `Model.sourceFor`.
 - New pure logic goes in `Model.js` with a test, not inline in QML.
+
+**Python (`ytm-store`)**
+
+- Keep the `python3 -I -S` shebang and the stdlib-only imports. Run it with
+  a minimal environment.
+- Walk directories from `$HOME` without following symlinks, require user
+  ownership, force the plugin-owned folders to 0700 and write files 0600
+  via an exclusive temporary plus rename.
+- Refuse symlinks, FIFOs, devices, oversized files and bad video ids
+  (`^[A-Za-z0-9_-]{11}$`) instead of trusting them. Reads must create
+  nothing.
+- Output is always one JSON line: `{"ok": true, …}` or
+  `{"ok": false, "error": "…"}`.
 
 **Words**
 
@@ -180,9 +206,10 @@ Run everything:
 bin/check
 ```
 
-That runs the node tests, `bash -n` and `shellcheck` on the backend, the
-manifest validator, the plain-text audit and the agent-file guard. CI runs
-the parts that work without Omarchy.
+That runs the node tests, the store tests (`bash tests/store-test.sh`, no
+network), `bash -n` and `shellcheck` on the backend, the manifest validator,
+the plain-text audit, the bidi-character audit, and the agent-file, size and
+symlink guards. CI runs the parts that work without Omarchy.
 
 Then check it by hand in the real shell:
 

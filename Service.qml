@@ -402,7 +402,7 @@ Item {
     if (msg.event === "property-change") {
       var d = msg.data
       switch (msg.name) {
-      case "pause": paused = d === true; break
+      case "pause": paused = d === true; if (paused) queueSave.restart(); break
       case "playlist": playlist = Array.isArray(d) ? d : []; queueSave.restart(); break
       case "playlist-pos": playlistPos = typeof d === "number" ? d : -1; queueSave.restart(); cacheLater.restart(); break
       case "duration": duration = typeof d === "number" && isFinite(d) ? d : 0; break

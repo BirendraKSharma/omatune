@@ -15,31 +15,34 @@ music keeps going.
 - Pick a song to play it now and fill the queue with its radio
 - Add songs to the queue, jump around in it, remove songs from it
 - Play/pause, next, back and seek from the panel, the bar or your media keys
+- **Search history** you can re-run, forget or clear
+- **Your queue survives restarts**: it comes back where you left off, and
+  resumes from the same second when you press play
+- **Offline cache**: songs you listen to are saved (up to a size you pick)
+  and play from disk, even without a connection
 - Background playback with no window, controlled from the bar
+- **Works out of the box on Omarchy**: nothing extra to install
 - No account, cookies or API key
 
 ## Requirements
+
+Nothing to install on Omarchy. Everything OmaTune uses ships with it:
 
 | Package | Why |
 |---|---|
 | `mpv` | plays the audio |
 | `yt-dlp` | resolves YouTube streams (mpv calls it) |
-| `mpv-mpris` | media keys and the Omarchy media widget (optional but recommended) |
-| `curl`, `jq` | InnerTube requests and parsing |
-| `deno` | lets yt-dlp solve YouTube's JavaScript challenges |
+| `mpv-mpris` | media keys and the Omarchy media widget |
+| `curl`, `jq`, `python` | InnerTube requests, parsing, and the storage helper |
 
-```bash
-omarchy pkg add mpv yt-dlp mpv-mpris jq deno
-```
+**Optional:** installing `deno` lets yt-dlp solve YouTube's JavaScript
+challenges. Without it, playback works today, but yt-dlp warns that this
+mode is deprecated, so a future YouTube change could need it.
 
-Keep **yt-dlp** up to date. When YouTube changes something, a yt-dlp update
-is almost always the fix.
+Keep **yt-dlp** up to date (`omarchy update` does it). When YouTube changes
+something, a yt-dlp update is almost always the fix.
 
 ## Install
-
-> **Manual setup:** OmaTune needs `mpv` and `yt-dlp` (and ideally
-> `mpv-mpris`, `jq` and `deno`), which Omarchy doesn't ship by default.
-> Install them first with the command above.
 
 ```bash
 omarchy plugin add https://github.com/codydon/omatune --enable
@@ -67,8 +70,20 @@ omarchy restart shell
 Removing the plugin deletes its folder and stops mpv with it (the `stop`
 line above just makes it immediate). The runtime folder
 `$XDG_RUNTIME_DIR/codydon-omatune/` is in memory and goes away when you log
-out. Nothing else is left behind: OmaTune writes no other files, and the
-packages from Requirements stay installed.
+out.
+
+**What stays after removal:** your saved data, in two folders only
+OmaTune writes to:
+
+| Folder | Holds |
+|---|---|
+| `~/.local/state/codydon-omatune/` | `history.json` (searches) and `queue.json` (saved queue) |
+| `~/.cache/codydon-omatune/audio/` | saved songs (`<id>.webm` / `<id>.m4a`) and their titles (`<id>.json`) |
+
+To remove that data too, use **CLEAR HISTORY** and **CLEAR OFFLINE SONGS**
+in the panel before removing the plugin, or delete those two folders
+yourself afterwards. (If you've set `XDG_STATE_HOME` or `XDG_CACHE_HOME`,
+the folders are under those instead.)
 
 ## Use
 
@@ -90,17 +105,23 @@ playing.
 |---|---|
 | `/` or `s` | Search |
 | `j` / `k` or arrows | Move through the list |
-| `enter` / `space` | Play the song (search results also start its radio) or jump to it (queue) |
-| `a` | Add the selected result to the queue |
-| `q` | Switch between search results and the queue |
-| `x` | Remove the selected song from the queue |
+| `enter` / `space` | Results: play and start a radio · Queue: jump to it · Cached: play from disk · History: search again |
+| `a` | Add the selected result or cached song to the queue |
+| `q` | Next list: Results → Queue → Cached → History |
+| `1` `2` `3` `4` | Go straight to Results, Queue, Cached or History |
+| `x` | Queue: remove the song · History: forget the search |
 | `p` | Play / pause |
 | `n` / `b` | Next / back (back restarts the song if it's past 3 seconds) |
 | `h` / `l` | Seek 10 seconds back / forward |
 | `esc` | In the search box: clear it, then leave it. Anywhere else: close the panel |
 
-With the mouse: click a row to play it. Middle- or right-clicking a result
-adds it to the queue, and doing the same on a queue row removes it.
+With the mouse: click a row to play it, and click the list names to switch.
+Middle- or right-clicking a result adds it to the queue, and doing the same
+on a queue row removes it. Songs marked 󰇚 are saved and play from disk.
+
+**After a restart** the queue view shows your **saved queue**, and the header
+says where it will resume. Nothing plays until you press play or pick a
+song.
 
 ## Settings
 
@@ -111,6 +132,9 @@ Change these in the Omarchy bar settings, or with `omarchy bar set`:
 | `showTitle` | `true` | Show the song title next to the icon |
 | `maxTitleChars` | `28` | Longest title shown in the bar (8–80) |
 | `autoRadio` | `true` | Queue the song's radio when you pick a search result |
+| `saveHistory` | `true` | Remember your searches |
+| `cacheSongs` | `true` | Save songs you listen to for 20 seconds for offline play |
+| `cacheLimitMB` | `1024` | Offline cache size in MB (100–20000); the oldest songs go first |
 
 ```bash
 omarchy bar set codydon.omatune maxTitleChars 40
@@ -137,8 +161,8 @@ don't need bindings for play/pause/next.
 
 ```
 Panel / bar ──► Service.qml ──► ytm-backend ──► music.youtube.com/youtubei/v1  (search, radio)
-                    │                └──────► starts / stops mpv
-                    └──── JSON IPC socket ──► mpv ──► yt-dlp ──► audio stream
+                    ├──► ytm-store (Python) ──► history, saved queue, offline cache
+                    └──── JSON IPC socket ──► mpv ──► yt-dlp ──► audio stream / saved file
 ```
 
 - **`ytm-backend`** sends InnerTube `search` and `next` requests as the
@@ -159,13 +183,22 @@ Panel / bar ──► Service.qml ──► ytm-backend ──► music.youtube.
   (search and radio), plus whatever stream URLs yt-dlp resolves for the song
   you play. No other hosts, and no data about you beyond what any signed-out
   visitor sends.
-- **Files:** only `$XDG_RUNTIME_DIR/codydon-omatune/mpv.sock` (mpv's control
-  socket), in a folder created mode 0700 and readable only by you. No logs,
-  caches or settings files.
+- **Files:** mpv's control socket in `$XDG_RUNTIME_DIR/codydon-omatune/`,
+  plus your data in `~/.local/state/codydon-omatune/` (search history and
+  the saved queue) and `~/.cache/codydon-omatune/audio/` (saved songs). All
+  three folders are created mode 0700 and every file 0600, readable only by
+  you. They're created the first time something is saved; just loading the
+  plugin writes nothing. See **Remove** for what stays behind.
+- **Saved songs** are downloaded by `yt-dlp` from YouTube, one at a time in
+  the background, after you've listened to a song for 20 seconds. Each is
+  checked to be real audio, and the cache never grows past `cacheLimitMB`.
+  Search history and offline saving can each be turned off in the settings.
 - **Processes:** one `mpv` (which runs `yt-dlp`), owned by the plugin. It
   starts when you first play something and stops with **Stop**, when the
   plugin is disabled or removed, or when the shell exits. Search and radio
-  requests run as short-lived `curl` + `jq` helpers with a 25-second limit.
+  requests run as short-lived `curl` + `jq` helpers with a 25-second limit,
+  and file work runs in a small Python helper (`ytm-store`); a song download
+  has a 5-minute limit and a 60 MB size cap.
   All of them get a minimal environment, not your whole shell environment.
 - **Config:** nothing. The plugin never edits `shell.json` or your Hyprland
   config; settings changes go through Omarchy's own settings API.
@@ -175,7 +208,8 @@ Panel / bar ──► Service.qml ──► ytm-backend ──► music.youtube.
 | Symptom | Try |
 |---|---|
 | "Couldn't reach YouTube Music" | Check your connection. If YouTube Music isn't available in your region, you may need a VPN. |
-| "Couldn't play …" | `yt-dlp -U` or update the package, then play the song again. |
+| "Couldn't play …" | Update yt-dlp (`omarchy update`), then play the song again. Saved songs still play offline. |
+| A song isn't saved offline | It's saved after 20 seconds of listening, one at a time. Check `cacheSongs` is on and the Cached list's header for errors. |
 | Search works but nothing plays | Play the song in a terminal to see the real error: `mpv --no-video https://music.youtube.com/watch?v=<id>` |
 | "The player stopped unexpectedly" | Check `mpv --version` and `yt-dlp --version` work, then play the song again. |
 | Widget missing or stale after an update | `omarchy restart shell` |
@@ -190,11 +224,12 @@ Check the backend on its own:
 
 ## Limitations
 
-- No thumbnails, offline downloads, local playlists or lyrics yet.
+- No thumbnails, local playlists or lyrics yet.
 - No access to your personal YouTube Music library (likes, playlists).
   That would need signing in, which this plugin deliberately doesn't do.
 - Restarting the shell stops the music (mpv belongs to the plugin, so it
-  can never be left running on its own).
+  can never be left running on its own), but the queue comes back and
+  resumes where you were.
 
 ## Support
 
