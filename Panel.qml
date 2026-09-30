@@ -7,9 +7,10 @@ import "Model.js" as Model
 // The YouTube Music popup: now playing with transport and a seek bar, a
 // search box, and one list that shows either search results or the queue.
 //
-// Keyboard: / search · j/k move · enter play · a add to queue · q next view
-// (1 results · 2 queue · 3 cached · 4 history) · p play/pause · n next ·
-// b back · h/l seek · x remove · esc close.
+// Keyboard: / search (↓↑ suggestions · tab complete) · j/k move · enter play
+// · a add to queue · q next view
+// (1 results · 2 queue · 3 cached · 4 history) · p play/pause · m mute ·
+// n next · b back · h/l seek · x remove · esc close.
 //
 // BarWidget.qml owns the bar button and injects bar, anchorItem, hostWidget
 // and service. Every string shown here came through Model.plain() in the
@@ -31,6 +32,7 @@ Panel {
   readonly property var viewNames: ({ results: "RESULTS", queue: "QUEUE", cached: "CACHED", history: "HISTORY" })
   property string view: "queue"
   property int cursor: -1
+  property int suggestCursor: -1
   // Clearing needs a second click within a few seconds.
   property string armedClear: ""
 
@@ -106,11 +108,28 @@ Panel {
     if (!service) return
     var q = searchField.text.trim()
     if (q === "") return
+    suggestCursor = -1
     service.search(q)
     view = "results"
     cursor = 0
     leaveSearch()
   }
+
+  function runSuggestion(index) {
+    if (!service || index < 0 || index >= service.suggestions.length) return
+    searchField.text = service.suggestions[index]
+    suggestCursor = -1
+    submitSearch()
+  }
+
+  function completeSuggestion() {
+    if (!service || suggestCursor < 0 || suggestCursor >= service.suggestions.length) return
+    searchField.text = service.suggestions[suggestCursor]
+    searchField.cursorPosition = searchField.text.length
+    suggestCursor = -1
+  }
+
+  readonly property bool suggestOpen: searchField.activeFocus && service !== null && service.suggestions.length > 0
 
   function setView(next) {
     if (view === next || views.indexOf(next) < 0) return
@@ -189,12 +208,22 @@ Panel {
       root.cursor = 0
       listFlick.contentY = 0
     }
+    function onSuggestionsChanged() { root.suggestCursor = -1 }
   }
 
   Timer {
     id: disarm
     interval: 4000
     onTriggered: root.armedClear = ""
+  }
+
+  // Autocomplete waits for a pause in typing before asking YouTube.
+  Timer {
+    id: suggestDebounce
+    interval: 300
+    onTriggered: {
+      if (root.service && searchField.activeFocus) root.service.fetchSuggestions(searchField.text)
+    }
   }
 
   component PlainText: Text {
@@ -231,6 +260,7 @@ Panel {
         if (!root.service) return
         if (t === "/" || t === "s") root.focusSearch()
         else if (t === "p") root.service.togglePause()
+        else if (t === "m") root.service.toggleMute()
         else if (t === "n") root.service.next()
         else if (t === "b") root.service.previous()
         else if (t === "a") root.addSelected()
@@ -275,6 +305,7 @@ Panel {
             var parts = []
             if (root.service.nowArtist) parts.push(root.service.nowArtist.toUpperCase())
             parts.push(root.service.buffering ? "LOADING" : (root.service.paused ? "PAUSED" : "PLAYING"))
+            if (root.service.muted) parts.push("MUTED")
             if (root.service.radioLoading) parts.push("FINDING RADIO")
             return parts.join(" · ")
           }
@@ -321,6 +352,13 @@ Panel {
             onClicked: if (root.service) root.service.next()
           }
           PanelActionButton {
+            iconText: root.service && root.service.muted ? "󰖁" : "󰕾"
+            tooltipText: root.service && root.service.muted ? "Unmute (m)" : "Mute (m)"
+            foreground: root.fg
+            fontFamily: root.fontFamily
+            onClicked: if (root.service) root.service.toggleMute()
+          }
+          PanelActionButton {
             iconText: "󰓛"
             tooltipText: "Stop and close the player"
             foreground: root.fg
@@ -365,18 +403,82 @@ Panel {
           foreground: root.fg
           font.family: root.fontFamily
           maximumLength: 200
+          onTextChanged: if (activeFocus) suggestDebounce.restart()
 
           Keys.onPressed: function(event) {
             if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-              root.submitSearch(); event.accepted = true
+              if (root.suggestOpen && root.suggestCursor >= 0) root.runSuggestion(root.suggestCursor)
+              else root.submitSearch()
+              event.accepted = true
             } else if (event.key === Qt.Key_Escape) {
               if (searchField.text !== "") searchField.text = ""
               else root.leaveSearch()
               event.accepted = true
             } else if (event.key === Qt.Key_Down) {
-              root.leaveSearch()
-              root.moveCursor(0)
+              if (root.suggestOpen) {
+                if (root.suggestCursor < root.service.suggestions.length - 1) root.suggestCursor++
+                else { root.suggestCursor = -1; root.leaveSearch(); root.moveCursor(0) }
+              } else {
+                root.leaveSearch()
+                root.moveCursor(0)
+              }
               event.accepted = true
+            } else if (event.key === Qt.Key_Up) {
+              if (root.suggestOpen && root.suggestCursor >= 0) root.suggestCursor--
+              event.accepted = true
+            } else if (event.key === Qt.Key_Tab) {
+              if (root.suggestOpen && root.suggestCursor >= 0) {
+                root.completeSuggestion()
+                event.accepted = true
+              }
+            }
+          }
+        }
+
+        // ---- Suggestions: YouTube completions for what is being typed.
+        Column {
+          width: parent.width
+          visible: root.suggestOpen
+
+          Repeater {
+            model: root.service ? root.service.suggestions : []
+
+            CursorSurface {
+              id: suggestRow
+              required property string modelData
+              required property int index
+              width: parent.width
+              height: Style.space(30)
+              foreground: root.fg
+              hasCursor: index === root.suggestCursor
+
+              MouseArea {
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onEntered: root.suggestCursor = suggestRow.index
+                onClicked: root.runSuggestion(suggestRow.index)
+              }
+
+              PlainText {
+                anchors.left: parent.left
+                anchors.leftMargin: Style.spacing.rowPaddingX
+                anchors.verticalCenter: parent.verticalCenter
+                width: Style.space(18)
+                text: "󰍉"
+                font.pixelSize: Style.font.body
+                color: root.dim
+              }
+
+              PlainText {
+                anchors.left: parent.left
+                anchors.leftMargin: Style.spacing.rowPaddingX + Style.space(24)
+                anchors.right: parent.right
+                anchors.rightMargin: Style.spacing.rowPaddingX
+                anchors.verticalCenter: parent.verticalCenter
+                text: suggestRow.modelData
+                font.pixelSize: Style.font.bodySmall
+              }
             }
           }
         }
@@ -612,10 +714,10 @@ Panel {
           color: root.dim
           font.pixelSize: Style.font.caption
           text: {
-            if (root.view === "results") return "/ search · enter play + radio · a add to queue · q next list · esc close"
+            if (root.view === "results") return "/ search (↓↑ pick · tab complete) · enter play + radio · a add to queue · q next list · esc close"
             if (root.view === "cached") return "enter play offline · a add to queue · q next list · esc close"
             if (root.view === "history") return "enter search again · x forget · q next list · esc close"
-            return "enter play · x remove · p pause · n next · b back · h/l seek · q next list"
+            return "enter play · x remove · p pause · m mute · n next · b back · h/l seek · q next list"
           }
         }
       }

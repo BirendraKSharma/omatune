@@ -14,6 +14,7 @@ var MAX_REPLY_BYTES = 262144
 var VIDEO_ID = /^[A-Za-z0-9_-]{11}$/
 var WATCH_PREFIX = "https://music.youtube.com/watch?v="
 var MAX_HISTORY = 50
+var MAX_SUGGESTIONS = 8
 var MAX_SAVED_QUEUE = 200
 // One argv string can't exceed 128 KiB on Linux; stay well under it.
 var MAX_SAVE_BYTES = 100000
@@ -121,6 +122,19 @@ function parseHistory(text) {
     if (typeof list[i] === "string" && q !== "") out.push(q)
   }
   return { ok: true, history: out }
+}
+
+// suggest: { ok, suggestions: [query, …] }
+function parseSuggestions(text) {
+  var r = parseJsonReply(text)
+  if (!r.ok) return r
+  var out = []
+  var list = Array.isArray(r.data.suggestions) ? r.data.suggestions : []
+  for (var i = 0; i < list.length && out.length < MAX_SUGGESTIONS; i++) {
+    var q = plain(list[i], 200).trim()
+    if (typeof list[i] === "string" && q !== "") out.push(q)
+  }
+  return { ok: true, suggestions: out }
 }
 
 // queue-get: { ok, queue: { tracks, index, position } }
@@ -310,6 +324,7 @@ if (typeof module !== "undefined") {
   module.exports = {
     plain: plain, isVideoId: isVideoId, watchUrl: watchUrl, idFromUrl: idFromUrl,
     validCacheDir: validCacheDir, sourceFor: sourceFor, parseHistory: parseHistory,
+    parseSuggestions: parseSuggestions,
     parseQueue: parseQueue, parseCache: parseCache, cacheMap: cacheMap,
     formatBytes: formatBytes, pushHistory: pushHistory, queueSnapshot: queueSnapshot,
     cleanTrack: cleanTrack, parseReply: parseReply, displayTitle: displayTitle,

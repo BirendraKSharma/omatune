@@ -109,7 +109,7 @@ Panel / BarWidget ──► Service.qml ──► ytm-backend ──► music.yo
 | `BarWidget.qml` | The bar button (one per monitor), IPC target `codydon.omatune`, hosts the panel |
 | `Panel.qml` | The popup: now playing, seek, transport, search, and the Results / Queue / Cached / History views |
 | `Model.js` | Pure logic with no Qt or I/O: parsing, cleaning, mpv commands, queue mapping, history / queue / cache helpers. Unit-tested under node |
-| `ytm-backend` | Bash: `search`, `radio <id>` (one JSON line each), and `player`, which execs mpv |
+| `ytm-backend` | Bash: `search`, `suggest <query>`, `radio <id>` (one JSON line each), and `player`, which execs mpv |
 | `ytm-store` | Python: `history-*`, `queue-get` / `queue-put`, `cache-list` / `cache-fetch` / `cache-touch` / `cache-clear` (one JSON line each). The only writer for state and cached audio |
 | `tests/` | Node tests for `Model.js` (`model-test.js`) and store tests in a throwaway HOME (`store-test.sh`, no network) |
 | `bin/check` | Every local check in one command |

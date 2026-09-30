@@ -8,6 +8,7 @@
 # mpv calls through its ytdl_hook.
 #
 #   ytm-backend search <query>     -> {"ok":true,"tracks":[...]}
+#   ytm-backend suggest <query>    -> {"ok":true,"suggestions":[...]}
 #   ytm-backend radio <videoId>    -> {"ok":true,"tracks":[...]}
 #   ytm-backend player             -> execs mpv (never returns on success)
 #
@@ -33,6 +34,7 @@ readonly SONGS_PARAMS='EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D'
 readonly MAX_RESPONSE=$((4 * 1024 * 1024))
 readonly MAX_QUERY=200
 readonly MAX_TRACKS=40
+readonly MAX_SUGGESTIONS=8
 
 : "${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR is not set}"
 readonly RUNTIME_DIR="$XDG_RUNTIME_DIR/codydon-omatune"
@@ -113,6 +115,30 @@ cmd_search() {
     | {ok: true, tracks: .}' 2>/dev/null || reply_error "YouTube Music answered with something unexpected. Try again in a moment."
 }
 
+cmd_suggest() {
+  local query=${1:-}
+  if [[ -z $query ]]; then "$JQ" -cn '{ok: true, suggestions: []}'; return; fi
+  (( ${#query} <= MAX_QUERY )) || reply_error "That search is too long."
+  [[ $query != *[[:cntrl:]]* ]] || reply_error "That search has characters YouTube can't take."
+
+  local response
+  response=$("$JQ" -cn --argjson ctx "$(context_json)" --arg q "$query" \
+      '{context: $ctx, input: $q}' \
+    | innertube music/get_search_suggestions) || reply_error "Couldn't reach YouTube Music. Check your connection, then search again."
+
+  # Suggestion rows carry the completed query to run plus the display text
+  # split into runs; prefer the completed query and clean it like the rest.
+  printf '%s' "$response" | "$JQ" -c --argjson max "$MAX_SUGGESTIONS" "$JQ_HELPERS"'
+    [ .. | objects | select(has("searchSuggestionRenderer")) | .searchSuggestionRenderer
+      | (.navigationEndpoint.searchEndpoint.query // "") as $q
+      | ([.suggestion.runs[]? | .text // ""] | add // "") as $t
+      | (if ($q | type) == "string" and $q != "" then $q else $t end | clean(200))
+      | select(. != "") ]
+    | reduce .[] as $s ([]; if any(.[]; . == $s) then . else . + [$s] end)
+    | .[0:$max]
+    | {ok: true, suggestions: .}' 2>/dev/null || reply_error "YouTube Music answered with something unexpected. Try again in a moment."
+}
+
 cmd_radio() {
   local id=${1:-}
   valid_video_id "$id" || reply_error "That isn't a YouTube video id."
@@ -165,9 +191,10 @@ main() {
   shift || true
   case $cmd in
     search) cmd_search "$@" ;;
+    suggest) cmd_suggest "$@" ;;
     radio) cmd_radio "$@" ;;
     player) cmd_player ;;
-    *) reply_error "Unknown command. Use search, radio or player." ;;
+    *) reply_error "Unknown command. Use search, suggest, radio or player." ;;
   esac
 }
 

@@ -111,6 +111,7 @@ playing.
 | `1` `2` `3` `4` | Go straight to Results, Queue, Cached or History |
 | `x` | Queue: remove the song · History: forget the search |
 | `p` | Play / pause |
+| `m` | Mute / unmute (the header shows MUTED) |
 | `n` / `b` | Next / back (back restarts the song if it's past 3 seconds) |
 | `h` / `l` | Seek 10 seconds back / forward |
 | `esc` | In the search box: clear it, then leave it. Anywhere else: close the panel |
@@ -118,6 +119,11 @@ playing.
 With the mouse: click a row to play it, and click the list names to switch.
 Middle- or right-clicking a result adds it to the queue, and doing the same
 on a queue row removes it. Songs marked 󰇚 are saved and play from disk.
+
+**While typing in the search box**, YouTube suggests completions: `↓` / `↑`
+to pick one, `enter` to search it, `tab` to complete it into the box, `esc`
+to clear. Typing two or more characters is enough; short input never leaves
+your machine.
 
 **After a restart** the queue view shows your **saved queue**, and the header
 says where it will resume. Nothing plays until you press play or pick a
@@ -147,6 +153,7 @@ The plugin answers IPC calls on the target `codydon.omatune`:
 ```bash
 omarchy-shell shell toggle codydon.omatune        # open/close on the focused monitor
 omarchy-shell codydon.omatune playPause
+omarchy-shell codydon.omatune toggleMute
 omarchy-shell codydon.omatune next
 omarchy-shell codydon.omatune previous
 omarchy-shell codydon.omatune stop                # stop and close the player

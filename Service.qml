@@ -49,10 +49,19 @@ Item {
   property string searchError: ""
   property int searchToken: 0
 
+  // ---- Search suggestions (best effort: failures clear, never error)
+  property var suggestions: []
+  property int suggestToken: 0
+
   // ---- Playback, mirrored from mpv
   property var playlist: []
   property int playlistPos: -1
   property bool paused: false
+  // mpv keeps two independent mutes (`mute` and `ao-mute`): media keys and
+  // MPRIS can set either one, so both are mirrored and either one counts.
+  property bool muteProp: false
+  property bool aoMuteProp: false
+  readonly property bool muted: muteProp || aoMuteProp
   property bool idle: true
   property bool buffering: false
   property real position: 0
@@ -131,6 +140,20 @@ Item {
       if (reply.tracks.length === 0) root.searchError = "No songs matched “" + Model.plain(q, 60) + "”. Try fewer words."
       else root.rememberSearch(q)
     })
+    suggestions = []
+  }
+
+  // Autocomplete for the search box. Same bounds as search, but failures
+  // stay silent: a missing dropdown must never break typing. Short input
+  // never reaches the network.
+  function fetchSuggestions(text) {
+    var q = String(text || "").replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 200)
+    if (q.length < 2) { suggestions = []; return }
+    var token = ++suggestToken
+    runBackend(["suggest", q], function(reply) {
+      if (token !== root.suggestToken) return
+      root.suggestions = reply.ok ? reply.suggestions : []
+    }, Model.parseSuggestions)
   }
 
   // ---------------------------------------------------------------- history
@@ -275,6 +298,22 @@ Item {
     if (restoring) resume(restored.index)
     else if (hasTrack) send(["cycle", "pause"])
   }
+  // mpv's mirrored mutes can lag (ao-mute only exists once there is an audio
+  // output), so ask it which way it is before flipping, instead of trusting
+  // the mirror and inverting the wrong way round.
+  property bool muteTogglePending: false
+
+  function toggleMute() {
+    if (!sockConnected || muteTogglePending) return
+    muteTogglePending = true
+    writeCommand(["get_property", "ao-mute"], 9003)
+  }
+
+  function applyMute(value) {
+    send(["set_property", "mute", value])
+    send(["set_property", "ao-mute", value])
+  }
+
   function next() { send(["playlist-next", "weak"]) }
   function previous() {
     // Like every music app: back restarts the song unless it just began.
@@ -353,6 +392,7 @@ Item {
     var old = sock
     sock = null
     sockConnected = false
+    muteTogglePending = false
     if (old) {
       old.connected = false
       old.destroy()
@@ -370,7 +410,7 @@ Item {
   function onMpvConnected() {
     starting = false
     connectRetry.stop()
-    var observed = ["pause", "playlist", "playlist-pos", "duration", "media-title", "idle-active", "paused-for-cache"]
+    var observed = ["pause", "mute", "ao-mute", "playlist", "playlist-pos", "duration", "media-title", "idle-active", "paused-for-cache"]
     for (var i = 0; i < observed.length; i++) writeCommand(["observe_property", i + 1, observed[i]])
     var queued = pending
     pending = []
@@ -381,6 +421,8 @@ Item {
     playlist = []
     playlistPos = -1
     paused = false
+    muteProp = false
+    aoMuteProp = false
     idle = true
     buffering = false
     position = 0
@@ -398,11 +440,20 @@ Item {
       if (typeof msg.data === "number" && isFinite(msg.data)) position = msg.data
       return
     }
+    if (msg.request_id === 9001) { muteProp = msg.data === true; return }
+    if (msg.request_id === 9002) { aoMuteProp = msg.data === true; return }
+    if (msg.request_id === 9003) {
+      muteTogglePending = false
+      applyMute(!(muteProp || msg.data === true))
+      return
+    }
 
     if (msg.event === "property-change") {
       var d = msg.data
       switch (msg.name) {
       case "pause": paused = d === true; if (paused) queueSave.restart(); break
+      case "mute": muteProp = d === true; break
+      case "ao-mute": aoMuteProp = d === true; break
       case "playlist": playlist = Array.isArray(d) ? d : []; queueSave.restart(); break
       case "playlist-pos": playlistPos = typeof d === "number" ? d : -1; queueSave.restart(); cacheLater.restart(); break
       case "duration": duration = typeof d === "number" && isFinite(d) ? d : 0; break
@@ -506,12 +557,23 @@ Item {
   }
 
   // time-pos changes every frame; asking once a second is plenty for a
-  // progress bar and costs nothing while paused or idle.
+  // progress bar and costs nothing while paused or idle. The same tick
+  // re-reads the mutes every few seconds, so a mute set from a media key
+  // or the media widget shows up even though mpv's ao-mute change events
+  // are not dependable.
   Timer {
+    id: playPoll
+    property int tick: 0
     interval: 1000
     repeat: true
     running: root.sockConnected && root.hasTrack && !root.paused
-    onTriggered: root.writeCommand(["get_property", "time-pos"], 9000)
+    onTriggered: {
+      root.writeCommand(["get_property", "time-pos"], 9000)
+      if (++playPoll.tick % 5 === 0) {
+        root.writeCommand(["get_property", "mute"], 9001)
+        root.writeCommand(["get_property", "ao-mute"], 9002)
+      }
+    }
   }
 
   // ---------------------------------------------------------------- saving
@@ -680,8 +742,8 @@ Item {
     }
   }
 
-  function runBackend(args, callback) {
-    startRun(["/usr/bin/timeout", "-k", "2", "--", "25", "/usr/bin/bash", backendPath].concat(args), Model.parseReply, 25, callback)
+  function runBackend(args, callback, parse) {
+    startRun(["/usr/bin/timeout", "-k", "2", "--", "25", "/usr/bin/bash", backendPath].concat(args), parse || Model.parseReply, 25, callback)
   }
 
   // The storage helper, with the system Python in isolated mode.

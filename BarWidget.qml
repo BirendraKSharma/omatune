@@ -101,6 +101,7 @@ BarWidget {
     function hide(): void { root.close() }
     function toggle(): void { root.togglePanel() }
     function playPause(): void { if (root.service) root.service.togglePause() }
+    function toggleMute(): void { if (root.service) root.service.toggleMute() }
     function next(): void { if (root.service) root.service.next() }
     function previous(): void { if (root.service) root.service.previous() }
     function stop(): void { if (root.service) root.service.stop() }

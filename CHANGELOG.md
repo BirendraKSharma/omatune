@@ -6,6 +6,17 @@ All notable changes are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-30
+
+### Added
+- Search suggestions: YouTube completions appear while typing (from two
+  characters), picked with `↓` / `↑`, searched with `enter`, completed with
+  `tab`. Failures stay silent so typing never breaks.
+- Mute toggle: `m` in the panel, a speaker button in the transport row, and
+  the `toggleMute` IPC command. The now-playing header shows MUTED, so a mute
+  set from media keys or the media widget is visible. Watches both of mpv's
+  mute properties (`mute` and `ao-mute`) and clears both when unmuting.
+
 ## [0.2.0] - 2026-09-28
 
 ### Added

@@ -139,6 +139,18 @@ test("parseHistory, parseQueue and parseCache only accept the documented shapes"
   assert.equal(M.parseQueue('{"ok":false,"error":"nope"}').ok, false)
 })
 
+test("parseSuggestions cleans, drops junk and caps at eight", () => {
+  const many = []
+  for (let i = 0; i < 12; i++) many.push("daft punk " + i)
+  const r = M.parseSuggestions(JSON.stringify({ ok: true, suggestions: ["daft punk", 5, "", "  ", ...many] }))
+  assert.equal(r.ok, true)
+  assert.equal(r.suggestions.length, 8)
+  assert.equal(r.suggestions[0], "daft punk")
+  assert.equal(r.suggestions[7], "daft punk 6")
+  assert.deepEqual(M.parseSuggestions('{"ok":true}').suggestions, [])
+  assert.equal(M.parseSuggestions('{"ok":false,"error":"nope"}').ok, false)
+})
+
 test("pushHistory keeps the newest first without case-insensitive duplicates", () => {
   let h = []
   for (const q of ["daft punk", "Future", "DAFT PUNK", "  "]) h = M.pushHistory(h, q)
